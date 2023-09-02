@@ -38,6 +38,7 @@
 #define PASSCODE_HI 0 //later both to be changed for AES crypto
 #define MSG_SIZE 16
 #define STARTER_BUTTON_TIMER 200
+#define MSG_A_PERIOD_S 10
 
 #define AT_MODEM_INFO "ATI\n\r"
 #define AT_MODEM_STATUS "AT+CFUN?\n\r"
@@ -71,18 +72,12 @@ UART_HandleTypeDef huart2;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
-void
-SystemClock_Config (void);
-static void
-MX_GPIO_Init (void);
-static void
-MX_SPI1_Init (void);
-static void
-MX_USART1_UART_Init (void);
-static void
-MX_USART2_UART_Init (void);
-static void
-MX_TIM14_Init (void);
+void SystemClock_Config(void);
+static void MX_GPIO_Init(void);
+static void MX_SPI1_Init(void);
+static void MX_USART1_UART_Init(void);
+static void MX_USART2_UART_Init(void);
+static void MX_TIM14_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -90,9 +85,12 @@ MX_TIM14_Init (void);
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 uint8_t modemRxData[200];
-uint16_t cutoffMinutesCounter;
-uint16_t cutoffMinutesSet;
-uint8_t timerExpired;
+uint8_t rxMsgDataTest[MSG_SIZE];
+int cutoffSecCounter;
+int cutoffMinutesSet;
+uint8_t motorTimerExpired;
+uint8_t msgATimerExpired;
+int msgASecCounter;
 
 enum GPIO_Pins_Used
 {
@@ -127,7 +125,13 @@ Modem_Reset (void)
 void
 HAL_UART_RxCpltCallback (UART_HandleTypeDef *huart)
 {
-  HAL_UART_Receive_IT (&huart2, modemRxData, sizeof(modemRxData));
+  if (huart == &huart2)
+    HAL_UART_Receive_IT (&huart2, modemRxData, sizeof(modemRxData));
+  else if (huart == &huart1) {
+    Handle_Msg_B(rxMsgDataTest);
+    memset(rxMsgDataTest, 0, sizeof(rxMsgDataTest));
+    HAL_UART_Receive_IT (&huart1, rxMsgDataTest, sizeof(rxMsgDataTest));
+  }
 }
 
 void
@@ -145,11 +149,6 @@ HAL_SPI_RxCpltCallback (SPI_HandleTypeDef *hspi)
 uint16_t
 ADC_Read (uint8_t channel)
 {
-  uint8_t infoTxt[20] =
-    { 0 };
-  sprintf (infoTxt, "SPI Test channel %d\n\r", channel);
-  HAL_UART_Transmit (&huart1, infoTxt, sizeof(infoTxt), 1000);
-
   uint8_t adcTx[3] =
     { 0x01, 0x80, 0x00 }; // start bit, channel id
   adcTx[1] = 0x80 | ((channel & 0x03) << 4);
@@ -178,29 +177,41 @@ Get_Rssi ()
 }
 
 void
-Start_Motor_Timer ()
-{
-  cutoffMinutesCounter = 0;
-  HAL_TIM_Base_Start_IT (&htim14);
-}
-
-void
-Stop_Motor_Timer ()
-{
-  HAL_TIM_Base_Stop_IT (&htim14);
-}
-
-void
 HAL_TIM_PeriodElapsedCallback (TIM_HandleTypeDef *htim)
 {
-  cutoffMinutesCounter += 1;
-  timerExpired = (cutoffMinutesCounter >= cutoffMinutesSet);
+  HAL_GPIO_TogglePin (GPIOB, GPIO_PIN_1);
+  msgASecCounter += 1;
+  if (msgASecCounter == MSG_A_PERIOD_S) {
+    msgATimerExpired = 1;
+    msgASecCounter = 0;
+  }
+
+  if (cutoffMinutesSet > 0) {
+    cutoffSecCounter += 1;
+  }
+
+  motorTimerExpired = ((cutoffSecCounter / 60) == cutoffMinutesSet);
+
+}
+
+void Start_Motor()
+{
+  HAL_GPIO_WritePin (GPIOC, GPIO_PIN_15, GPIO_PIN_SET);
+  HAL_Delay (STARTER_BUTTON_TIMER);
+  HAL_GPIO_WritePin (GPIOC, GPIO_PIN_15, GPIO_PIN_RESET);
+}
+
+void Stop_Motor()
+{
+  HAL_GPIO_WritePin (GPIOC, GPIO_PIN_14, GPIO_PIN_SET);
+  HAL_Delay (STARTER_BUTTON_TIMER);
+  HAL_GPIO_WritePin (GPIOC, GPIO_PIN_14, GPIO_PIN_RESET);
 }
 
 uint16_t
 Get_Rem_Time ()
 {
-  return cutoffMinutesCounter;
+  return (cutoffSecCounter/60);
 }
 
 GPIO_PinState
@@ -286,7 +297,7 @@ Handle_Msg_B (uint8_t buffer[MSG_SIZE])
   if (buffer[3] != DEVICE_ID)
     return;
 
-  uint16_t remTime = ((buffer[5] << 8) & 0xFF00) | (buffer[4] & 0xFF);
+  int16_t remTime = ((buffer[5] << 8) & 0xFF00) | (buffer[4] & 0xFF);
   uint8_t motorState = buffer[6] & 0x1;
   uint8_t val0State = (buffer[6] >> 1) & 0x1;
   uint8_t val1State = (buffer[6] >> 2) & 0x1;
@@ -294,19 +305,14 @@ Handle_Msg_B (uint8_t buffer[MSG_SIZE])
   HAL_GPIO_WritePin (GPIOB, GPIO_PIN_2, val0State);
   HAL_GPIO_WritePin (GPIOA, GPIO_PIN_8, val1State);
 
+  cutoffMinutesSet = remTime;
   if (remTime > 0)
     {
-      HAL_GPIO_WritePin (GPIOC, GPIO_PIN_15, GPIO_PIN_SET);
-      sleep (STARTER_BUTTON_TIMER);
-      HAL_GPIO_WritePin (GPIOC, GPIO_PIN_15, GPIO_PIN_RESET);
-      Start_Motor_Timer ();
+      Start_Motor();
     }
-  else if (motorState == 0)
+  else if (remTime == 0)
     {
-      Stop_Motor_Timer ();
-      HAL_GPIO_WritePin (GPIOC, GPIO_PIN_14, GPIO_PIN_SET);
-      sleep (STARTER_BUTTON_TIMER);
-      HAL_GPIO_WritePin (GPIOC, GPIO_PIN_14, GPIO_PIN_RESET);
+      Stop_Motor();
     }
 }
 
@@ -317,14 +323,22 @@ Print_Modem_Output ()
   HAL_UART_Transmit (&huart1, "\n", 2, 1000);
   memset (modemRxData, 0, sizeof(modemRxData));
 }
+
+void Send_Msg_A()
+{
+  uint8_t buffer[MSG_SIZE];
+  memset(buffer, 0, sizeof(buffer));
+  Gen_Msg_A(buffer);
+
+  HAL_UART_Transmit (&huart1, buffer, sizeof(buffer), 100);
+}
 /* USER CODE END 0 */
 
 /**
- * @brief  The application entry point.
- * @retval int
- */
-int
-main (void)
+  * @brief  The application entry point.
+  * @retval int
+  */
+int main(void)
 {
   /* USER CODE BEGIN 1 */
 
@@ -333,25 +347,25 @@ main (void)
   /* MCU Configuration--------------------------------------------------------*/
 
   /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
-  HAL_Init ();
+  HAL_Init();
 
   /* USER CODE BEGIN Init */
 
   /* USER CODE END Init */
 
   /* Configure the system clock */
-  SystemClock_Config ();
+  SystemClock_Config();
 
   /* USER CODE BEGIN SysInit */
 
   /* USER CODE END SysInit */
 
   /* Initialize all configured peripherals */
-  MX_GPIO_Init ();
-  MX_SPI1_Init ();
-  MX_USART1_UART_Init ();
-  MX_USART2_UART_Init ();
-  MX_TIM14_Init ();
+  MX_GPIO_Init();
+  MX_SPI1_Init();
+  MX_USART1_UART_Init();
+  MX_USART2_UART_Init();
+  MX_TIM14_Init();
   /* USER CODE BEGIN 2 */
     {
       unsigned int *optionByte = (unsigned int*) 0x1FFF7800;
@@ -362,6 +376,7 @@ main (void)
 
   memset (modemRxData, 0, sizeof(modemRxData));
   HAL_UART_Receive_IT (&huart2, modemRxData, sizeof(modemRxData));
+  HAL_UART_Receive_IT (&huart1, rxMsgDataTest, sizeof(rxMsgDataTest));
 
   // ADC CS Pin
   HAL_GPIO_WritePin (GPIOB, GPIO_PIN_0, GPIO_PIN_SET);
@@ -405,6 +420,11 @@ main (void)
   //ADC_Read(1);
   //ADC_Read(2);
   //ADC_Read(3);
+  msgATimerExpired = 0;
+  motorTimerExpired = 0;
+  cutoffSecCounter = 0;
+  cutoffMinutesSet = -1;
+  HAL_TIM_Base_Start_IT (&htim14);
 
   /* USER CODE END 2 */
 
@@ -412,65 +432,71 @@ main (void)
   /* USER CODE BEGIN WHILE */
   while (1)
     {
-      /* USER CODE END WHILE */
+    /* USER CODE END WHILE */
 
-      /* USER CODE BEGIN 3 */
-      HAL_GPIO_TogglePin (GPIOB, GPIO_PIN_1);
-      HAL_Delay (500);
+    /* USER CODE BEGIN 3 */
+      if (msgATimerExpired) {
+	  Send_Msg_A ();
+	  msgASecCounter = 0;
+	  msgATimerExpired = 0;
+      }
+
+      if (motorTimerExpired) {
+          Stop_Motor();
+          cutoffSecCounter = 0;
+          cutoffMinutesSet = -1;
+          motorTimerExpired = 0;
+        }
     }
   /* USER CODE END 3 */
 }
 
 /**
- * @brief System Clock Configuration
- * @retval None
- */
-void
-SystemClock_Config (void)
+  * @brief System Clock Configuration
+  * @retval None
+  */
+void SystemClock_Config(void)
 {
-  RCC_OscInitTypeDef RCC_OscInitStruct =
-    { 0 };
-  RCC_ClkInitTypeDef RCC_ClkInitStruct =
-    { 0 };
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
 
   /** Configure the main internal regulator output voltage
-   */
-  HAL_PWREx_ControlVoltageScaling (PWR_REGULATOR_VOLTAGE_SCALE1);
+  */
+  HAL_PWREx_ControlVoltageScaling(PWR_REGULATOR_VOLTAGE_SCALE1);
 
   /** Initializes the RCC Oscillators according to the specified parameters
-   * in the RCC_OscInitTypeDef structure.
-   */
+  * in the RCC_OscInitTypeDef structure.
+  */
   RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
   RCC_OscInitStruct.HSIState = RCC_HSI_ON;
   RCC_OscInitStruct.HSIDiv = RCC_HSI_DIV1;
   RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_NONE;
-  if (HAL_RCC_OscConfig (&RCC_OscInitStruct) != HAL_OK)
-    {
-      Error_Handler ();
-    }
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+  {
+    Error_Handler();
+  }
 
   /** Initializes the CPU, AHB and APB buses clocks
-   */
-  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_SYSCLK
-      | RCC_CLOCKTYPE_PCLK1;
+  */
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+                              |RCC_CLOCKTYPE_PCLK1;
   RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_HSI;
   RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
   RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
 
-  if (HAL_RCC_ClockConfig (&RCC_ClkInitStruct, FLASH_LATENCY_0) != HAL_OK)
-    {
-      Error_Handler ();
-    }
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_0) != HAL_OK)
+  {
+    Error_Handler();
+  }
 }
 
 /**
- * @brief SPI1 Initialization Function
- * @param None
- * @retval None
- */
-static void
-MX_SPI1_Init (void)
+  * @brief SPI1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_SPI1_Init(void)
 {
 
   /* USER CODE BEGIN SPI1_Init 0 */
@@ -495,10 +521,10 @@ MX_SPI1_Init (void)
   hspi1.Init.CRCPolynomial = 7;
   hspi1.Init.CRCLength = SPI_CRC_LENGTH_DATASIZE;
   hspi1.Init.NSSPMode = SPI_NSS_PULSE_DISABLE;
-  if (HAL_SPI_Init (&hspi1) != HAL_OK)
-    {
-      Error_Handler ();
-    }
+  if (HAL_SPI_Init(&hspi1) != HAL_OK)
+  {
+    Error_Handler();
+  }
   /* USER CODE BEGIN SPI1_Init 2 */
 
   /* USER CODE END SPI1_Init 2 */
@@ -506,12 +532,11 @@ MX_SPI1_Init (void)
 }
 
 /**
- * @brief TIM14 Initialization Function
- * @param None
- * @retval None
- */
-static void
-MX_TIM14_Init (void)
+  * @brief TIM14 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM14_Init(void)
 {
 
   /* USER CODE BEGIN TIM14_Init 0 */
@@ -522,15 +547,15 @@ MX_TIM14_Init (void)
 
   /* USER CODE END TIM14_Init 1 */
   htim14.Instance = TIM14;
-  htim14.Init.Prescaler = 2000;
+  htim14.Init.Prescaler = 16000-1;
   htim14.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim14.Init.Period = 60000;
+  htim14.Init.Period = 1000-1;
   htim14.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
   htim14.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
-  if (HAL_TIM_Base_Init (&htim14) != HAL_OK)
-    {
-      Error_Handler ();
-    }
+  if (HAL_TIM_Base_Init(&htim14) != HAL_OK)
+  {
+    Error_Handler();
+  }
   /* USER CODE BEGIN TIM14_Init 2 */
 
   /* USER CODE END TIM14_Init 2 */
@@ -538,12 +563,11 @@ MX_TIM14_Init (void)
 }
 
 /**
- * @brief USART1 Initialization Function
- * @param None
- * @retval None
- */
-static void
-MX_USART1_UART_Init (void)
+  * @brief USART1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_USART1_UART_Init(void)
 {
 
   /* USER CODE BEGIN USART1_Init 0 */
@@ -564,24 +588,22 @@ MX_USART1_UART_Init (void)
   huart1.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
   huart1.Init.ClockPrescaler = UART_PRESCALER_DIV1;
   huart1.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
-  if (HAL_UART_Init (&huart1) != HAL_OK)
-    {
-      Error_Handler ();
-    }
-  if (HAL_UARTEx_SetTxFifoThreshold (&huart1, UART_TXFIFO_THRESHOLD_1_8)
-      != HAL_OK)
-    {
-      Error_Handler ();
-    }
-  if (HAL_UARTEx_SetRxFifoThreshold (&huart1, UART_RXFIFO_THRESHOLD_1_8)
-      != HAL_OK)
-    {
-      Error_Handler ();
-    }
-  if (HAL_UARTEx_DisableFifoMode (&huart1) != HAL_OK)
-    {
-      Error_Handler ();
-    }
+  if (HAL_UART_Init(&huart1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_SetTxFifoThreshold(&huart1, UART_TXFIFO_THRESHOLD_1_8) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_SetRxFifoThreshold(&huart1, UART_RXFIFO_THRESHOLD_1_8) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_DisableFifoMode(&huart1) != HAL_OK)
+  {
+    Error_Handler();
+  }
   /* USER CODE BEGIN USART1_Init 2 */
 
   /* USER CODE END USART1_Init 2 */
@@ -589,12 +611,11 @@ MX_USART1_UART_Init (void)
 }
 
 /**
- * @brief USART2 Initialization Function
- * @param None
- * @retval None
- */
-static void
-MX_USART2_UART_Init (void)
+  * @brief USART2 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_USART2_UART_Init(void)
 {
 
   /* USER CODE BEGIN USART2_Init 0 */
@@ -615,10 +636,10 @@ MX_USART2_UART_Init (void)
   huart2.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
   huart2.Init.ClockPrescaler = UART_PRESCALER_DIV1;
   huart2.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
-  if (HAL_UART_Init (&huart2) != HAL_OK)
-    {
-      Error_Handler ();
-    }
+  if (HAL_UART_Init(&huart2) != HAL_OK)
+  {
+    Error_Handler();
+  }
   /* USER CODE BEGIN USART2_Init 2 */
 
   /* USER CODE END USART2_Init 2 */
@@ -626,17 +647,15 @@ MX_USART2_UART_Init (void)
 }
 
 /**
- * @brief GPIO Initialization Function
- * @param None
- * @retval None
- */
-static void
-MX_GPIO_Init (void)
+  * @brief GPIO Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_GPIO_Init(void)
 {
-  GPIO_InitTypeDef GPIO_InitStruct =
-    { 0 };
-  /* USER CODE BEGIN MX_GPIO_Init_1 */
-  /* USER CODE END MX_GPIO_Init_1 */
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+/* USER CODE BEGIN MX_GPIO_Init_1 */
+/* USER CODE END MX_GPIO_Init_1 */
 
   /* GPIO Ports Clock Enable */
   __HAL_RCC_GPIOB_CLK_ENABLE();
@@ -644,72 +663,71 @@ MX_GPIO_Init (void)
   __HAL_RCC_GPIOA_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin (GPIOC, GPIO_PIN_14 | GPIO_PIN_15, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_14|GPIO_PIN_15, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin (GPIOA, GPIO_PIN_4 | GPIO_PIN_5, GPIO_PIN_SET);
+  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4|GPIO_PIN_5, GPIO_PIN_SET);
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin (GPIOB, GPIO_PIN_0 | GPIO_PIN_1 | GPIO_PIN_2 | GPIO_PIN_5,
-		     GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0|GPIO_PIN_1|GPIO_PIN_2|GPIO_PIN_5, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin (GPIOA, GPIO_PIN_8, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_8, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin (GPIOB, GPIO_PIN_4, GPIO_PIN_SET);
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_4, GPIO_PIN_SET);
 
   /*Configure GPIO pins : PB9 PB6 */
-  GPIO_InitStruct.Pin = GPIO_PIN_9 | GPIO_PIN_6;
+  GPIO_InitStruct.Pin = GPIO_PIN_9|GPIO_PIN_6;
   GPIO_InitStruct.Mode = GPIO_MODE_AF_OD;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   GPIO_InitStruct.Alternate = GPIO_AF6_I2C1;
-  HAL_GPIO_Init (GPIOB, &GPIO_InitStruct);
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
   /*Configure GPIO pins : PC14 PC15 */
-  GPIO_InitStruct.Pin = GPIO_PIN_14 | GPIO_PIN_15;
+  GPIO_InitStruct.Pin = GPIO_PIN_14|GPIO_PIN_15;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init (GPIOC, &GPIO_InitStruct);
+  HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
 
   /*Configure GPIO pins : PA4 PA5 */
-  GPIO_InitStruct.Pin = GPIO_PIN_4 | GPIO_PIN_5;
+  GPIO_InitStruct.Pin = GPIO_PIN_4|GPIO_PIN_5;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_OD;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init (GPIOA, &GPIO_InitStruct);
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
   /*Configure GPIO pins : PB0 PB1 PB2 PB5 */
-  GPIO_InitStruct.Pin = GPIO_PIN_0 | GPIO_PIN_1 | GPIO_PIN_2 | GPIO_PIN_5;
+  GPIO_InitStruct.Pin = GPIO_PIN_0|GPIO_PIN_1|GPIO_PIN_2|GPIO_PIN_5;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init (GPIOB, &GPIO_InitStruct);
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
   /*Configure GPIO pin : PA8 */
   GPIO_InitStruct.Pin = GPIO_PIN_8;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init (GPIOA, &GPIO_InitStruct);
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
   /*Configure GPIO pin : PA15 */
   GPIO_InitStruct.Pin = GPIO_PIN_15;
   GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
-  HAL_GPIO_Init (GPIOA, &GPIO_InitStruct);
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
   /*Configure GPIO pin : PB4 */
   GPIO_InitStruct.Pin = GPIO_PIN_4;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_OD;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init (GPIOB, &GPIO_InitStruct);
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
-  /* USER CODE BEGIN MX_GPIO_Init_2 */
-  /* USER CODE END MX_GPIO_Init_2 */
+/* USER CODE BEGIN MX_GPIO_Init_2 */
+/* USER CODE END MX_GPIO_Init_2 */
 }
 
 /* USER CODE BEGIN 4 */
@@ -717,11 +735,10 @@ MX_GPIO_Init (void)
 /* USER CODE END 4 */
 
 /**
- * @brief  This function is executed in case of error occurrence.
- * @retval None
- */
-void
-Error_Handler (void)
+  * @brief  This function is executed in case of error occurrence.
+  * @retval None
+  */
+void Error_Handler(void)
 {
   /* USER CODE BEGIN Error_Handler_Debug */
   /* User can add his own implementation to report the HAL error return state */
