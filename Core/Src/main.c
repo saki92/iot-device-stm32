@@ -91,6 +91,7 @@ int cutoffMinutesSet;
 uint8_t motorTimerExpired;
 uint8_t msgATimerExpired;
 int msgASecCounter;
+uint8_t msgBRx;
 
 enum GPIO_Pins_Used
 {
@@ -128,8 +129,7 @@ HAL_UART_RxCpltCallback (UART_HandleTypeDef *huart)
   if (huart == &huart2)
     HAL_UART_Receive_IT (&huart2, modemRxData, sizeof(modemRxData));
   else if (huart == &huart1) {
-    Handle_Msg_B(rxMsgDataTest);
-    memset(rxMsgDataTest, 0, sizeof(rxMsgDataTest));
+    msgBRx = 1;
     HAL_UART_Receive_IT (&huart1, rxMsgDataTest, sizeof(rxMsgDataTest));
   }
 }
@@ -179,7 +179,6 @@ Get_Rssi ()
 void
 HAL_TIM_PeriodElapsedCallback (TIM_HandleTypeDef *htim)
 {
-  HAL_GPIO_TogglePin (GPIOB, GPIO_PIN_1);
   msgASecCounter += 1;
   if (msgASecCounter == MSG_A_PERIOD_S) {
     msgATimerExpired = 1;
@@ -188,10 +187,8 @@ HAL_TIM_PeriodElapsedCallback (TIM_HandleTypeDef *htim)
 
   if (cutoffMinutesSet > 0) {
     cutoffSecCounter += 1;
+    motorTimerExpired = (cutoffSecCounter == (cutoffMinutesSet * 60 + 1));
   }
-
-  motorTimerExpired = ((cutoffSecCounter / 60) == cutoffMinutesSet);
-
 }
 
 void Start_Motor()
@@ -211,7 +208,7 @@ void Stop_Motor()
 uint16_t
 Get_Rem_Time ()
 {
-  return (cutoffSecCounter/60);
+  return (cutoffMinutesSet - cutoffSecCounter/60);
 }
 
 GPIO_PinState
@@ -262,10 +259,15 @@ Gen_Msg_A (uint8_t buffer[MSG_SIZE])
   buffer[3] = DEVICE_ID;
   buffer[4] = Get_Rssi ();
 
-  uint16_t adc0 = ADC_Read (0);
+  /*uint16_t adc0 = ADC_Read (0);
   uint16_t adc1 = ADC_Read (1);
   uint16_t adc2 = ADC_Read (2);
-  uint16_t adc3 = ADC_Read (3);
+  uint16_t adc3 = ADC_Read (3);*/
+
+  uint16_t adc0 = 100;
+  uint16_t adc1 = 450;
+  uint16_t adc2 = 560;
+  uint16_t adc3 = 190;
   buffer[5] = adc0 & 0xFF; // 8 bits
   buffer[6] = (adc0 >> 8) & 0x3; // LSB 2 bits
 
@@ -273,7 +275,7 @@ Gen_Msg_A (uint8_t buffer[MSG_SIZE])
   buffer[7] = (adc1 >> 6) & 0xF; // LSB 4 bits
 
   buffer[7] |= (adc2 << 4) & 0xF0; // MSB 4 bits
-  buffer[8] = (adc2 >> 4) & 0x3F0; // LSB 6 bits
+  buffer[8] = (adc2 >> 4) & 0x3F; // LSB 6 bits
 
   buffer[8] |= (adc3 << 6) & 0xC0; // LSB 2 bits
   buffer[9] = (adc3 >> 2) & 0xFF; // MSB 8 bits
@@ -297,7 +299,7 @@ Handle_Msg_B (uint8_t buffer[MSG_SIZE])
   if (buffer[3] != DEVICE_ID)
     return;
 
-  int16_t remTime = ((buffer[5] << 8) & 0xFF00) | (buffer[4] & 0xFF);
+  uint16_t remTime = ((buffer[5] << 8) & 0xFF00) | (buffer[4] & 0xFF);
   uint8_t motorState = buffer[6] & 0x1;
   uint8_t val0State = (buffer[6] >> 1) & 0x1;
   uint8_t val1State = (buffer[6] >> 2) & 0x1;
@@ -305,15 +307,19 @@ Handle_Msg_B (uint8_t buffer[MSG_SIZE])
   HAL_GPIO_WritePin (GPIOB, GPIO_PIN_2, val0State);
   HAL_GPIO_WritePin (GPIOA, GPIO_PIN_8, val1State);
 
-  cutoffMinutesSet = remTime;
+  HAL_GPIO_TogglePin (GPIOB, GPIO_PIN_1);
   if (remTime > 0)
     {
+      cutoffMinutesSet = remTime;
       Start_Motor();
     }
   else if (remTime == 0)
     {
       Stop_Motor();
+      cutoffSecCounter = 0;
+      cutoffMinutesSet = 0;
     }
+  return;
 }
 
 void
@@ -329,8 +335,8 @@ void Send_Msg_A()
   uint8_t buffer[MSG_SIZE];
   memset(buffer, 0, sizeof(buffer));
   Gen_Msg_A(buffer);
-
-  HAL_UART_Transmit (&huart1, buffer, sizeof(buffer), 100);
+  HAL_UART_Transmit (&huart1, buffer, sizeof(buffer), 1000);
+  //HAL_UART_Transmit (&huart1, "\r", sizeof("\r"), 1000);
 }
 /* USER CODE END 0 */
 
@@ -382,6 +388,7 @@ int main(void)
   HAL_GPIO_WritePin (GPIOB, GPIO_PIN_0, GPIO_PIN_SET);
   HAL_GPIO_WritePin (GPIOA, GPIO_PIN_4, GPIO_PIN_RESET);
 
+  /*
   Start_Modem (GPIOA, GPIO_PIN_4, 1000, 1000);
   Print_Modem_Output ();
   //Modem_Reset();
@@ -409,6 +416,7 @@ int main(void)
   HAL_Delay (1000);
   Modem_Send_Command (&huart2, AT_GET_BAND);
   Print_Modem_Output ();
+  */
 
   //HAL_Delay(1000);
   //Modem_Send_Command(&huart2, AT_OPS_SEARCH);
@@ -423,7 +431,7 @@ int main(void)
   msgATimerExpired = 0;
   motorTimerExpired = 0;
   cutoffSecCounter = 0;
-  cutoffMinutesSet = -1;
+  cutoffMinutesSet = 0;
   HAL_TIM_Base_Start_IT (&htim14);
 
   /* USER CODE END 2 */
@@ -444,9 +452,15 @@ int main(void)
       if (motorTimerExpired) {
           Stop_Motor();
           cutoffSecCounter = 0;
-          cutoffMinutesSet = -1;
+          cutoffMinutesSet = 0;
           motorTimerExpired = 0;
         }
+
+      if (msgBRx) {
+	  Handle_Msg_B(rxMsgDataTest);
+	  memset(rxMsgDataTest, 0, sizeof(rxMsgDataTest));
+	  msgBRx = 0;
+      }
     }
   /* USER CODE END 3 */
 }
@@ -581,7 +595,7 @@ static void MX_USART1_UART_Init(void)
   huart1.Init.BaudRate = 9600;
   huart1.Init.WordLength = UART_WORDLENGTH_8B;
   huart1.Init.StopBits = UART_STOPBITS_1;
-  huart1.Init.Parity = UART_PARITY_EVEN;
+  huart1.Init.Parity = UART_PARITY_NONE;
   huart1.Init.Mode = UART_MODE_TX_RX;
   huart1.Init.HwFlowCtl = UART_HWCONTROL_NONE;
   huart1.Init.OverSampling = UART_OVERSAMPLING_16;
